@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#USAGE: ./vote.sh
+#USAGE: cat list_of_votes.txt | grep -v "BEGIN VOTE" | grep -v "END VOTE" | ./verify.sh GITHUB_ISSUE_NUMBER
 
 #Make sure jq is installed
 checkjq() {
@@ -8,16 +8,6 @@ checkjq() {
         echo "jq installed... proceeding"
     else
         sudo apt install jq
-    fi
-}
-
-#Make sure shasum256 is installed
-checkshasum() {
-    if hash sha256sum 2>/dev/null; then
-        echo "sha256sum installed... proceeding"
-    else
-        echo "Hmmm... couldn't find sha256sum... exiting"
-    exit
     fi
 }
 
@@ -32,40 +22,84 @@ checkcurl() {
 
 checkjq
 checkcurl
-checkshasum
 cd ~
-UUID=$(cat resuser/resnode/config/config.json | jq -r .super.nodeid)
-HASHED_UUID=$(echo -n $UUID | sha256sum | cut -d" " -f1)
-TADDR=$(curl -s https://resnode.resistance.io/api/nodes | jq -r '.[] | select(.hashed_uuid=='\"$HASHED_UUID\"') | .taddr')
 
-if [ -z "$TADDR" ]
-then
-      echo "Something went wrong... Please try again later."
-      exit
-fi
+EXPECTED_ISSUE_NUMBER=$1
 
-echo -n "What GitHub Issue number are you voting for?: "
-read ISSUE_NUMBER
+yes=0
+no=0
 
-re='^[0-9]+$'
-if ! [[ $ISSUE_NUMBER =~ $re ]] ; then
-   echo "Error: Not a number. Please try again with a valid GitHub issue number." >&2; exit 1
-fi
+voted_addr=()
 
-echo -n "Do you vote (Y)es or (N)o to the proposal in GitHub issue $ISSUE_NUMBER ? (Y/N): "
-read VOTE_VALUE
+while read VOTE
+do
+    #echo $VOTE
+    VOTE_VALUE=$(echo $VOTE | cut -d":" -f1)
+    ISSUE_NUMBER=$(echo $VOTE | cut -d":" -f2)
+    TADDR=$(echo $VOTE | cut -d":" -f3)
+    TIMESTAMP=$(echo $VOTE | cut -d":" -f4)
+    SIGNATURE=$(echo $VOTE | cut -d":" -f5)
+    MESSAGE="$VOTE_VALUE:$ISSUE_NUMBER:$TADDR:$TIMESTAMP"
 
-if [[ "$VOTE_VALUE" != "Y" ]] && [[ "$VOTE_VALUE" != "N" ]]
-then
-    echo "Invalid vote. You must choose either Y or N. Please try again with a valid vote."
-    exit 1
-fi
+    node_alive=$(curl -s https://resnode.resistance.io/api/nodes | jq -r '.[] | select(.taddr=='\"$TADDR\"') | .hashed_uuid')
+    if [ -z "$node_alive" ]
+    then
+      echo ""
+      echo "INVALID! : Node used for Signing is Not Live. Vote Rejected: $VOTE"
+      echo ""
+      continue
+    fi
 
-VOTE="$VOTE_VALUE:$ISSUE_NUMBER:$TADDR:$(date '+%s')"
-echo "Please copy and paste the following (including BEGIN and END lines) into the GitHub issue you referenced above:"
+    if [[ "$EXPECTED_ISSUE_NUMBER" != "$ISSUE_NUMBER" ]]
+    then
+    	echo ""
+    	echo "INVALID! : Github Issue Number Not Correct. Vote Rejected: $VOTE"
+    	echo ""
+    	continue
+    fi
+
+    #docker exec -it -u resuser $(docker ps | grep resistance-core | awk '{print $1}') ./resistance/resistance-cli verifymessage "$TADDR" "$SIGNATURE" "$MESSAGE"
+
+    verify=$(docker exec -u resuser $(docker ps | grep resistance-core | awk '{print $1}') ./resistance/resistance-cli verifymessage "$TADDR" "$SIGNATURE" "$MESSAGE")
+
+    if [[ "$verify" != "true" ]]
+    then
+    	echo ""
+    	echo "INVALID! : Invalid Message Signature. Vote Rejected: $VOTE"
+    	echo ""
+    	continue
+    fi
+
+
+    #at this point we have concluded that this is a valid vote and we count it
+
+    if [[ " ${voted_addr[@]} " =~ " ${TADDR} " ]]; then
+        echo ""
+        echo "INVALID! : This Masternode already voted. Vote Rejected: $VOTE"
+        echo ""
+        continue
+    fi
+
+    #at this point we have concluded that this is a valid vote and we count it
+
+    if [[ "$VOTE_VALUE" == "N" ]]
+    then
+        no=$((no+1))
+    fi
+
+    if [[ "$VOTE_VALUE" == "Y" ]]
+    then
+        yes=$((yes+1))
+    fi
+
+    voted_addr+=$TADDR
+done
 
 echo ""
-echo "-----BEGIN VOTE-----"
-echo "$VOTE:$(docker exec -u resuser $(docker ps | grep resistance-core | awk '{print $1}') ./resistance/resistance-cli signmessage $TADDR $VOTE)"
-echo "-----END VOTE-----"
-echo ""
+echo "--------------------------------------------------------"
+echo "| Final Tally for GitHub Issue: $EXPECTED_ISSUE_NUMBER "
+echo "--------------------------------------------------------"
+echo "| YES: $yes                                            "
+echo "|-------------------------------------------------------"
+echo "| NO: $no                                             "
+echo "--------------------------------------------------------"
